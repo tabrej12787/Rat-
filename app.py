@@ -1,326 +1,430 @@
-import os, re, threading, time
+"""Search API — HF DuckDB Search + Dashboard"""
+import asyncio
+import json
+import os
+import time
+import tempfile
+from typing import Optional
+
 import duckdb
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-HF = (os.getenv("ICMR_HF_INDEX_BASE") or
-      "https://huggingface.co/buckets/godhosting/bakchodipromax/resolve/main").rstrip("/")
+# ── Config ────────────────────────────────────────────────────────────────
+HF_INDEX_BASE = os.environ.get(
+    "ICMR_HF_INDEX_BASE",
+    "https://huggingface.co/buckets/godhosting/bakchodipromax/resolve/main",
+).rstrip("/")
 
-DUP_CAP = 2
+THREADS = int(os.environ.get("ICMR_THREADS", "1"))
+DUPLICATE_CAP = 2
+TIMEOUT_DEFAULT = int(os.environ.get("ICMR_TIMEOUT", "25"))
+
+SEARCH_FIELDS = [
+    "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
+    "address", "district", "pincode", "state", "town", "source",
+]
 NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
-ALL_FIELDS = ["name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
-              "address", "district", "pincode", "state", "town", "source"]
-INDEXES = {k: [f"{HF}/idx_{k}.{i}.parquet" for i in range(7)] for k in ("phone", "aadhar")}
 
-_lock, _conn = threading.Lock(), None
-_status = {"phone_loaded": False, "aadhar_loaded": False, "error": None, "details": {}}
+REMOTE_INDEXES = {
+    "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(7)],
+    "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
+}
+
+app = FastAPI(
+    title="Search API — Tridev Cyber Warrior",
+    description="HF-backed DuckDB search API.",
+    version="2.0.0",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_conn: Optional[duckdb.DuckDBPyConnection] = None
+_load_status = {
+    "phone_loaded": False,
+    "aadhar_loaded": False,
+    "error": None,
+    "init_time": None,
+    "details": {}
+}
 
 
-def init():
+def _init_conn() -> duckdb.DuckDBPyConnection:
     global _conn
-    if _conn:
+    if _conn is not None:
         return _conn
-    with _lock:
-        if _conn:
-            return _conn
-        c = duckdb.connect(":memory:")
-        c.execute("SET home_directory='/tmp'")
-        c.execute("SET extension_directory='/tmp/duckdb_extensions'")
+
+    con = duckdb.connect(database=":memory:")
+    tmp_dir = tempfile.gettempdir()
+
+    con.execute(f"SET home_directory='{tmp_dir}'")
+    con.execute(f"SET extension_directory='{tmp_dir}/duckdb_extensions'")
+    con.execute("SET threads = ?", [THREADS])
+    con.execute("SET http_keep_alive=false;")
+    con.execute("SET enable_http_metadata_cache=true;")
+
+    try:
+        con.execute("INSTALL parquet; LOAD parquet;")
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+        _load_status["details"]["extensions"] = "loaded"
+    except Exception as e:
+        _load_status["error"] = f"Extension load failed: {e}"
+        _load_status["details"]["extensions"] = str(e)
+
+    for kind, urls in REMOTE_INDEXES.items():
+        view = f"people_{kind}"
         try:
-            c.execute("INSTALL httpfs")
-            c.execute("LOAD httpfs")
-            _status["details"]["httpfs"] = "ok"
+            test_url = urls[0]
+            test_query = f"SELECT count(*) FROM read_parquet('{test_url}', union_by_name=true) LIMIT 1"
+            con.execute(test_query).fetchone()
+
+            lst = ", ".join(f"'{u}'" for u in urls)
+            con.execute(
+                f"CREATE OR REPLACE VIEW {view} AS "
+                f"SELECT * FROM read_parquet([{lst}], union_by_name=true)"
+            )
+            _load_status[f"{kind}_loaded"] = True
+            _load_status["details"][kind] = "success"
         except Exception as e:
-            try:
-                c.execute("LOAD httpfs")
-                _status["details"]["httpfs"] = "cached"
-            except Exception as e2:
-                _status["error"] = str(e2)[:200]
-                _status["details"]["httpfs"] = str(e2)[:200]
-        for kind, urls in INDEXES.items():
-            try:
-                c.execute(f"SELECT count(*) FROM read_parquet('{urls[0]}', union_by_name=true) LIMIT 1").fetchall()
-                c.execute(
-                    f"CREATE OR REPLACE VIEW people_{kind} AS "
-                    f"SELECT * FROM read_parquet([{','.join(repr(u) for u in urls)}], union_by_name=true)"
-                )
-                _status[f"{kind}_loaded"] = True
-                _status["details"][kind] = "ok"
-            except Exception as e:
-                _status["details"][kind] = str(e)[:200]
-        _conn = c
-        return c
+            _load_status["error"] = f"{kind} load failed: {str(e)[:200]}"
+            _load_status["details"][kind] = str(e)[:200]
+
+    _load_status["init_time"] = time.time()
+    _conn = con
+    return con
 
 
-def ready(kind):
-    return bool(_status.get(f"{kind}_loaded"))
+def _ready(kind: str) -> bool:
+    return bool(_load_status.get(f"{kind}_loaded"))
 
 
-def person_key(r):
-    ph = str(r.get("phoneNumber") or "").strip()
-    ad = str(r.get("aadharNumber") or "").strip()
-    return f"{ph}|{ad}" if (ph or ad) else f"{r.get('name')}|{r.get('fathersName')}"
+def _person_key(row: dict) -> tuple:
+    ph = (row.get("phoneNumber") or "").strip()
+    ad = (row.get("aadharNumber") or "").strip()
+    if ph or ad:
+        return (ph, ad)
+    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
 
 
-def connected_numbers(r):
-    seen, out = set(), []
+def _connected_numbers(row: dict) -> list:
+    out, seen = [], set()
     for f in NUMBER_FIELDS:
-        v = str(r.get(f) or "").strip()
-        if v and v not in seen:
-            seen.add(v)
-            out.append({"field": f, "value": v})
+        v = row.get(f)
+        if not v:
+            continue
+        s = str(v).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append({"field": f, "value": s})
     return out
 
 
-def cap(rows):
-    seen, out = {}, []
+def _cap(rows: list) -> list:
+    seen = {}
+    out = []
     for r in rows:
-        k = person_key(r)
+        k = _person_key(r)
         n = seen.get(k, 0)
-        if n < DUP_CAP:
+        if n < DUPLICATE_CAP:
             seen[k] = n + 1
-            r = dict(r)
-            r["connected_numbers"] = connected_numbers(r)
-            out.append(r)
+            rec = dict(r)
+            rec["connected_numbers"] = _connected_numbers(rec)
+            out.append(rec)
     return out
 
 
-def run_search(view, field, val, mode, limit):
-    c = init()
-    v = str(val).replace("'", "''")
-    if mode == "exact":
-        sql = f"SELECT * FROM {view} WHERE {field}='{v}' LIMIT {limit * DUP_CAP + 20}"
+def _field_search(field: str, value: str, mode: str, limit: int) -> dict:
+    if field not in SEARCH_FIELDS:
+        raise ValueError(f"Unknown field: {field}")
+
+    con = _init_conn()
+    v = str(value).replace("'", "''")
+
+    if field == "phoneNumber" and _ready("phone"):
+        view = "people_phone"
+    elif field == "aadharNumber" and _ready("aadhar"):
+        view = "people_aadhar"
     else:
-        v2 = v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        sql = f"SELECT * FROM {view} WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUP_CAP + 20}"
-    cur = c.execute(sql)
-    cols = [d[0] for d in cur.description]
-    return cap([dict(zip(cols, row)) for row in cur.fetchall()])[:limit]
+        return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+
+    if mode == "exact":
+        sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
+    else:
+        v2 = v.replace("%", r"\%").replace("_", r"\_")
+        sql = (
+            f"SELECT * FROM {view} WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' "
+            f"LIMIT {limit * DUPLICATE_CAP + 20}"
+        )
+
+    try:
+        rows = con.execute(sql).fetchall()
+        cols = [d[0] for d in con.description]
+        results = _cap([dict(zip(cols, r)) for r in rows])[:limit]
+        return {"field": field, "value": value, "mode": mode,
+                "count": len(results), "results": results}
+    except Exception as e:
+        return {"field": field, "value": value, "mode": mode,
+                "count": 0, "results": [], "error": str(e)}
 
 
-app = FastAPI(title="Info Search API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+def _unified(q: str, limit: int) -> dict:
+    q = q.strip()
+    if not (q.isdigit() and len(q) >= 8):
+        return {"query": q, "searched_fields": [], "count": 0, "results": []}
+
+    rows, searched = [], []
+    if _ready("phone"):
+        r = _field_search("phoneNumber", q, "exact", limit)
+        rows.extend(r["results"])
+        searched.append("phoneNumber")
+    if not rows and _ready("aadhar"):
+        r = _field_search("aadharNumber", q, "exact", limit)
+        rows.extend(r["results"])
+        searched.append("aadharNumber")
+
+    rows = _cap(rows)[:limit]
+    return {"query": q, "searched_fields": searched,
+            "count": len(rows), "results": rows}
 
 
+# ── Dashboard HTML ────────────────────────────────────────────────────────
 CSS = """
 <style>
-  * { box-sizing: border-box; }
-  body { font-family: -apple-system, system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
-  .container { max-width: 1000px; margin: 0 auto; }
-  h1 { margin: 0 0 6px 0; font-size: 24px; }
-  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
-  .sub a { color: #60a5fa; text-decoration: none; margin-right: 10px; }
-  .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
-  h2 { margin-top: 0; font-size: 16px; }
-  .status { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px; font-weight: 600; font-size: 13px; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
-  .stat { background: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #334155; }
-  .stat-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.5px; }
-  .stat-value { font-size: 14px; font-weight: 600; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { padding: 10px; text-align: left; border-bottom: 1px solid #334155; vertical-align: top; }
-  th { color: #94a3b8; font-size: 11px; text-transform: uppercase; }
-  tr:last-child td { border-bottom: none; }
-  a { color: #60a5fa; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  code { background: #0f172a; padding: 2px 6px; border-radius: 4px; font-size: 12px; color: #fbbf24; }
-  .err { background: #7f1d1d; border: 1px solid #ef4444; color: #fecaca; padding: 12px; border-radius: 8px; margin-top: 12px; font-size: 13px; word-break: break-word; }
-  input { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 10px; border-radius: 6px; font-size: 14px; width: 100%; }
-  button { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; white-space: nowrap; }
-  button:hover { background: #2563eb; }
-  pre { background: #0f172a; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; margin: 0; max-height: 400px; overflow-y: auto; }
-  .row { display: flex; gap: 8px; }
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:20px}
+  .container{max-width:1000px;margin:0 auto}
+  h1{margin:0 0 6px;font-size:24px}
+  .sub{color:#94a3b8;font-size:13px;margin-bottom:20px}
+  .sub a{color:#60a5fa;text-decoration:none;margin-right:10px}
+  .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:20px;margin-bottom:16px}
+  h2{margin-top:0;font-size:16px}
+  .status{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:999px;font-weight:600;font-size:13px}
+  .dot{width:10px;height:10px;border-radius:50%}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+  .stat{background:#0f172a;padding:12px;border-radius:8px;border:1px solid #334155}
+  .stat-label{font-size:11px;color:#94a3b8;text-transform:uppercase;margin-bottom:4px;letter-spacing:.5px}
+  .stat-value{font-size:14px;font-weight:600}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:10px;text-align:left;border-bottom:1px solid #334155;vertical-align:top}
+  th{color:#94a3b8;font-size:11px;text-transform:uppercase}
+  tr:last-child td{border-bottom:none}
+  a{color:#60a5fa;text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{background:#0f172a;padding:2px 6px;border-radius:4px;font-size:12px;color:#fbbf24}
+  .err{background:#7f1d1d;border:1px solid #ef4444;color:#fecaca;padding:12px;border-radius:8px;margin-top:12px;font-size:13px;word-break:break-word}
+  input,select{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:10px;border-radius:6px;font-size:14px}
+  input{width:100%}
+  button{background:#3b82f6;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-weight:600;white-space:nowrap}
+  button:hover{background:#2563eb}
+  pre{background:#0f172a;padding:12px;border-radius:6px;overflow:auto;font-size:12px;margin:0;max-height:400px}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  .row input{flex:1;min-width:200px}
 </style>
 """
 
 SCRIPT = """
 <script>
-async function testSearch() {
-  const q = document.getElementById('q').value.trim();
-  if (!q) return;
-  const out = document.getElementById('out');
-  out.textContent = 'Searching...';
-  try {
-    const r = await fetch('/search?q=' + encodeURIComponent(q));
-    const d = await r.json();
-    out.textContent = JSON.stringify(d, null, 2);
-  } catch (e) {
-    out.textContent = 'Error: ' + e.message;
-  }
+async function testSearch(){
+  const q=document.getElementById('q').value.trim();
+  const mode=document.getElementById('mode').value;
+  const limit=document.getElementById('limit').value;
+  if(!q)return;
+  const out=document.getElementById('out');
+  out.textContent='Searching... (first time 30-90s)';
+  try{
+    const r=await fetch('/search?q='+encodeURIComponent(q)+'&mode='+mode+'&limit='+limit+'&timeout=90');
+    const d=await r.json();
+    out.textContent=JSON.stringify(d,null,2);
+  }catch(e){out.textContent='Error: '+e.message;}
 }
-document.getElementById('q').addEventListener('keydown', function(e) {
-  if (e.key === 'Enter') testSearch();
-});
+document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')testSearch();});
 </script>
 """
 
 
 @app.get("/", response_class=HTMLResponse)
-def root():
-    try:
-        init()
-    except Exception:
-        pass
-
-    phone_ok = ready("phone")
-    aadhar_ok = ready("aadhar")
-    err = _status.get("error")
-    details = _status.get("details", {})
+async def root():
+    phone_ok = _ready("phone")
+    aadhar_ok = _ready("aadhar")
+    err = _load_status.get("error")
+    details = _load_status.get("details", {})
 
     if err:
-        status_bg, status_fg, status_text = "#7f1d1d", "#fca5a5", "ERROR"
+        bg, fg, txt = "#7f1d1d", "#fca5a5", "ERROR"
     elif phone_ok and aadhar_ok:
-        status_bg, status_fg, status_text = "#064e3b", "#6ee7b7", "HEALTHY"
+        bg, fg, txt = "#064e3b", "#6ee7b7", "HEALTHY"
     else:
-        status_bg, status_fg, status_text = "#78350f", "#fcd34d", "DEGRADED"
+        bg, fg, txt = "#78350f", "#fcd34d", "NOT LOADED YET"
 
-    error_html = f'<div class="err"><strong>⚠️ Error:</strong> {err}</div>' if err else ""
-    phone_badge = "✅ Loaded" if phone_ok else "❌ Not loaded"
-    aadhar_badge = "✅ Loaded" if aadhar_ok else "❌ Not loaded"
-    httpfs_status = details.get("httpfs", "unknown")
+    err_html = f'<div class="err"><strong>⚠️ Error:</strong> {err}</div>' if err else ""
+    ph_badge = "✅ Loaded" if phone_ok else "❌ Not loaded"
+    ad_badge = "✅ Loaded" if aadhar_ok else "❌ Not loaded"
+    ext = details.get("extensions", "unknown")
     extra = "".join(
         f'<tr><td><code>{k}</code></td><td>{v}</td></tr>'
-        for k, v in details.items() if k not in ("httpfs", "phone", "aadhar")
-    ) or '<tr><td colspan="2" style="color:#64748b;">no extra details</td></tr>'
+        for k, v in details.items() if k not in ("extensions", "phone", "aadhar")
+    ) or '<tr><td colspan="2" style="color:#64748b;">—</td></tr>'
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Info Search API — Dashboard</title>
-{CSS}
-</head>
-<body>
-<div class="container">
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Info Search API</title>{CSS}</head>
+<body><div class="container">
   <h1>🔍 Info Search API</h1>
-  <div class="sub">
-    Develop by Tridev Cyber Warrior &middot;
+  <div class="sub">Develop by Tridev Cyber Warrior &middot;
     <a href="/health" target="_blank">/health</a>
     <a href="/warmup" target="_blank">/warmup</a>
     <a href="/fields" target="_blank">/fields</a>
   </div>
 
   <div class="card">
-    <div class="status" style="background: {status_bg}; color: {status_fg};">
-      <span class="dot" style="background: {status_fg};"></span>
-      {status_text}
+    <div class="status" style="background:{bg};color:{fg};">
+      <span class="dot" style="background:{fg};"></span>{txt}
     </div>
-    {error_html}
+    {err_html}
   </div>
 
   <div class="card">
     <h2>Index Load Status</h2>
     <div class="grid">
-      <div class="stat">
-        <div class="stat-label">Phone Index</div>
-        <div class="stat-value">{phone_badge}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Aadhar Index</div>
-        <div class="stat-value">{aadhar_badge}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">httpfs Extension</div>
-        <div class="stat-value">{httpfs_status}</div>
-      </div>
+      <div class="stat"><div class="stat-label">Phone Index</div><div class="stat-value">{ph_badge}</div></div>
+      <div class="stat"><div class="stat-label">Aadhar Index</div><div class="stat-value">{ad_badge}</div></div>
+      <div class="stat"><div class="stat-label">Extensions</div><div class="stat-value">{ext}</div></div>
     </div>
-    <table style="margin-top:16px;">
-      <tr><th>Detail</th><th>Value</th></tr>
-      {extra}
-    </table>
+    <table style="margin-top:16px;"><tr><th>Detail</th><th>Value</th></tr>{extra}</table>
   </div>
 
   <div class="card">
-    <h2>📋 All Commands / Endpoints</h2>
+    <h2>📋 All Endpoints</h2>
     <table>
       <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
-      <tr><td>GET</td><td><a href="/" target="_blank"><code>/</code></a></td><td>This dashboard</td></tr>
-      <tr><td>GET</td><td><a href="/health" target="_blank"><code>/health</code></a></td><td>Health check (JSON)</td></tr>
-      <tr><td>GET</td><td><a href="/warmup" target="_blank"><code>/warmup</code></a></td><td>Force init indexes (first time slow)</td></tr>
-      <tr><td>GET</td><td><a href="/fields" target="_blank"><code>/fields</code></a></td><td>List searchable fields</td></tr>
-      <tr><td>GET</td><td><a href="/search?q=6290593159" target="_blank"><code>/search?q=...</code></a></td><td>Unified search (phone → aadhar fallback)</td></tr>
-      <tr><td>GET</td><td><a href="/search?field=phoneNumber&q=6290593159&mode=exact" target="_blank"><code>/search?field=...&amp;q=...</code></a></td><td>Field search (exact or like)</td></tr>
+      <tr><td>GET</td><td><a href="/" target="_blank"><code>/</code></a></td><td>Dashboard</td></tr>
+      <tr><td>GET</td><td><a href="/health" target="_blank"><code>/health</code></a></td><td>Health + load status</td></tr>
+      <tr><td>GET</td><td><a href="/warmup" target="_blank"><code>/warmup</code></a></td><td>Force init indexes (slow first time)</td></tr>
+      <tr><td>GET</td><td><a href="/fields" target="_blank"><code>/fields</code></a></td><td>Available fields</td></tr>
+      <tr><td>GET</td><td><a href="/search?q=6290593159" target="_blank"><code>/search?q=...</code></a></td><td>Unified search (phone → aadhar)</td></tr>
+      <tr><td>GET</td><td><a href="/search?field=phoneNumber&q=6290593159&mode=exact" target="_blank"><code>/search?field=...&amp;q=...&amp;mode=exact|contains</code></a></td><td>Field search</td></tr>
     </table>
   </div>
 
   <div class="card">
     <h2>🧪 Quick Search Test</h2>
-    <div class="row">
-      <input id="q" placeholder="Enter phone / aadhar (10+ digits)..." />
+    <div class="row" style="margin-bottom:8px;">
+      <input id="q" placeholder="Phone / Aadhar (8+ digits)..."/>
+      <select id="mode">
+        <option value="exact">exact</option>
+        <option value="contains">contains</option>
+      </select>
+      <select id="limit">
+        <option value="10">limit 10</option>
+        <option value="25">limit 25</option>
+        <option value="50">limit 50</option>
+      </select>
       <button onclick="testSearch()">Search</button>
     </div>
-    <pre id="out" style="margin-top:12px;">Result will appear here...</pre>
+    <pre id="out">Result will appear here...</pre>
   </div>
-</div>
-{SCRIPT}
-</body>
-</html>"""
-    return HTMLResponse(html)
+</div>{SCRIPT}</body></html>""")
 
 
 @app.get("/health")
-def health():
+async def health():
+    loop = asyncio.get_running_loop()
     try:
-        init()
+        await asyncio.wait_for(loop.run_in_executor(None, _init_conn), timeout=45)
+    except asyncio.TimeoutError:
+        return {"status": "timeout", "error": "DuckDB init took > 45s"}
     except Exception as e:
-        return JSONResponse({"status": "error", "error": str(e)}, 500)
+        return {"status": "error", "error": str(e)}
+
     return {
-        "status": "degraded" if _status["error"] else "healthy",
-        "indexes": {"phone": ready("phone"), "aadhar": ready("aadhar")},
-        "load_status": _status,
+        "status": "healthy" if not _load_status["error"] else "degraded",
+        "indexes": {"phone": _ready("phone"), "aadhar": _ready("aadhar")},
+        "load_status": _load_status,
         "timestamp": time.time(),
     }
 
 
 @app.get("/warmup")
-def warmup():
+async def warmup():
+    loop = asyncio.get_running_loop()
     try:
-        init()
+        await asyncio.wait_for(loop.run_in_executor(None, _init_conn), timeout=45)
+        return {
+            "status": "warmed up",
+            "indexes": {"phone": _ready("phone"), "aadhar": _ready("aadhar")},
+            "load_status": _load_status,
+        }
+    except asyncio.TimeoutError:
+        return {"error": "Warmup timeout (>45s)"}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
-    return {
-        "status": "warmed up",
-        "indexes": {"phone": ready("phone"), "aadhar": ready("aadhar")},
-        "load_status": _status,
-    }
-
-
-@app.get("/fields")
-def fields():
-    return {"fields": ALL_FIELDS, "number_fields": NUMBER_FIELDS}
+        return {"error": str(e)}
 
 
 @app.get("/search")
-def search(q: str = Query(None), mobile: str = Query(None), field: str = Query(None),
-           mode: str = "exact", limit: int = 10):
-    val = (q or mobile or "").strip()
-    if not val:
-        return JSONResponse({"error": "Provide 'q' or 'mobile'"}, 422)
-    if field and field not in ALL_FIELDS:
-        return JSONResponse({"error": f"Unknown field: {field}"}, 422)
-    limit = max(1, min(200, limit))
+async def search(
+    q: Optional[str] = Query(None),
+    mobile: Optional[str] = Query(None),
+    field: Optional[str] = Query(None),
+    mode: str = Query("exact", pattern="^(exact|contains)$"),
+    limit: int = Query(10, ge=1, le=200),
+    timeout: int = Query(TIMEOUT_DEFAULT, ge=5, le=120),
+    pretty: bool = Query(True),
+):
+    start = time.time()
+    query = (q or mobile or "").strip()
+    if not query:
+        raise HTTPException(422, "Provide 'q' or 'mobile'")
 
     try:
-        rows = []
-        if field == "phoneNumber" and ready("phone"):
-            rows = run_search("people_phone", "phoneNumber", val, mode, limit)
-        elif field == "aadharNumber" and ready("aadhar"):
-            rows = run_search("people_aadhar", "aadharNumber", val, mode, limit)
-        elif re.fullmatch(r"\d{8,}", val):
-            if ready("phone"):
-                rows = run_search("people_phone", "phoneNumber", val, mode, limit)
-            if not rows and ready("aadhar"):
-                rows = run_search("people_aadhar", "aadharNumber", val, mode, limit)
+        loop = asyncio.get_running_loop()
+        if field:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, _field_search, field, query, mode, limit),
+                timeout=timeout,
+            )
+        else:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, _unified, query, limit),
+                timeout=timeout,
+            )
+    except asyncio.TimeoutError:
+        return Response(
+            content=json.dumps({"error": "timeout", "query": query}),
+            status_code=504, media_type="application/json",
+        )
     except Exception as e:
-        return JSONResponse({"error": str(e), "query": val}, 500)
+        return Response(
+            content=json.dumps({"error": str(e)}),
+            status_code=500, media_type="application/json",
+        )
 
-    return {
-        "success": len(rows) > 0,
-        "query": val,
-        "count": len(rows),
-        "results": rows,
+    body = {
+        "success": data.get("count", 0) > 0,
+        "query": query,
+        "count": data.get("count", 0),
+        "results": data.get("results", []),
+        "execution_time": round(time.time() - start, 3),
         "author": "Develop by Tridev Cyber Warrior",
     }
+    return Response(
+        content=json.dumps(body, indent=2 if pretty else None, ensure_ascii=False),
+        media_type="application/json",
+    )
+
+
+@app.get("/fields")
+async def fields():
+    return {"fields": SEARCH_FIELDS, "number_fields": NUMBER_FIELDS}
+
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0",
+                port=int(os.environ.get("PORT", 8000)))
