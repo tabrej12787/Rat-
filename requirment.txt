@@ -1,1 +1,4 @@
-pyTelegramBotAPI==4.13.0
+fastapi
+uvicorn
+duckdb
+duckdb-core-ext-httpfs
